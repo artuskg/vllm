@@ -187,6 +187,7 @@ class VoxtralProcessingInfo(BaseProcessingInfo):
     def get_data_parser(self):
         return MultiModalDataParser(
             target_sr=self.get_hf_processor().sampling_rate,
+            target_channels=1,
             expected_hidden_size=self._get_expected_hidden_size(),
         )
 
@@ -289,10 +290,26 @@ class VoxtralMultiModalProcessor(BaseMultiModalProcessor[VoxtralProcessingInfo])
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
 
         audio_id = processor.audio_token_id
+        out_mm_data = out_mm_kwargs.require_data()
+        out_audio_items = out_mm_data.get("audio", [])
 
         def get_replacement(item_idx: int):
-            audios = mm_items.get_items("audio", AudioProcessorItems)
-            audio_len = audios.get_audio_length(item_idx)
+            if item_idx < len(out_audio_items):
+                out_audio_data = out_audio_items[item_idx].get_data()
+                audio_arr = out_audio_data["audio_arrays"]
+                if isinstance(audio_arr, torch.Tensor):
+                    audio_len = len(audio_arr)
+                elif isinstance(audio_arr, np.ndarray):
+                    audio_len = len(audio_arr)
+                else:
+                    raise TypeError(
+                        "Unexpected type for audio_arrays in out_mm_kwargs: "
+                        f"{type(audio_arr)}"
+                    )
+            else:
+                # Fallback for unexpected processor outputs.
+                audios = mm_items.get_items("audio", AudioProcessorItems)
+                audio_len = audios.get_audio_length(item_idx)
 
             nb_audio_tokens = processor.get_num_audio_tokens(audio_len)
 
@@ -495,7 +512,10 @@ class VoxtralForConditionalGeneration(
         return TokensPrompt(
             prompt_token_ids=tokenized.tokens,
             multi_modal_data={
-                "audio": (tokenized.audios[0].audio_array, stt_config.sample_rate)
+                "audio": [
+                    (audio.audio_array, stt_config.sample_rate)
+                    for audio in tokenized.audios
+                ],
             },
         )
 
@@ -767,14 +787,28 @@ class VoxtralEncoderModel(nn.Module):
             max_frequency=8000.0,
             sampling_rate=self.config.sampling_rate,
         )
-        self.mel_filters = torch.tensor(mel_filters, dtype=torch.float32)
+        self.register_buffer(
+            "mel_filters",
+            torch.tensor(mel_filters, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "hann_window",
+            torch.hann_window(
+                self.config.window_size,
+                periodic=True,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
 
     def compute_whisper_melspec(
         self,
         audio_waveforms: torch.Tensor,
     ) -> torch.Tensor:
         input_dtype = audio_waveforms.dtype
-        window = torch.hann_window(self.config.window_size).to(audio_waveforms.device)
+        audio_waveforms = audio_waveforms.to(torch.float32)
+        window = self.hann_window.to(audio_waveforms.device)
         stft = torch.stft(
             audio_waveforms,
             self.config.window_size,
@@ -783,7 +817,8 @@ class VoxtralEncoderModel(nn.Module):
             return_complex=True,
         )
         magnitudes = stft[..., :-1].abs() ** 2
-        mel_spec = self.mel_filters.T @ magnitudes
+        mel_filters = self.mel_filters.to(audio_waveforms.device)
+        mel_spec = mel_filters.T @ magnitudes
         log_spec = torch.clamp(mel_spec, min=1e-10).log10()
 
         if global_log_mel_max := self.config.global_log_mel_max:
@@ -811,46 +846,83 @@ class VoxtralEncoderModel(nn.Module):
     def chunk_size(self) -> int:
         return self.config.max_source_positions * self.downsample_factor
 
+    @staticmethod
+    def _conv_out_len(input_len: int, conv: nn.Conv1d) -> int:
+        padding = conv.padding[0]
+        dilation = conv.dilation[0]
+        kernel_size = conv.kernel_size[0]
+        stride = conv.stride[0]
+        return (
+            (input_len + 2 * padding - dilation * (kernel_size - 1) - 1) // stride
+        ) + 1
+
     def prepare_inputs_for_conv(
         self,
         audio_waveforms: list[torch.Tensor],
-    ) -> tuple[torch.Tensor, list[int]]:
+    ) -> tuple[torch.Tensor, list[int], list[int]]:
         assert isinstance(audio_waveforms, list)
         # list[num_mel_bins, seq_len]
-        input_features = [
+        log_mel_features = [
             self.compute_whisper_melspec(audio).to(self.dtype)
             for audio in audio_waveforms
         ]
 
         chunked_features: list[torch.Tensor] = []
         chunks_per_example: list[int] = []
-        for feature in input_features:
+        conv_out_lens: list[int] = []
+        for feature in log_mel_features:
             chunks = feature.split(self.chunk_size, dim=-1)
-            chunked_features += chunks
+            for chunk in chunks:
+                chunk_len = chunk.shape[-1]
+                conv_out_len = self._conv_out_len(
+                    self._conv_out_len(chunk_len, self.whisper_encoder.conv1),
+                    self.whisper_encoder.conv2,
+                )
+
+                if chunk_len < self.chunk_size:
+                    chunk = torch.nn.functional.pad(
+                        chunk,
+                        (0, self.chunk_size - chunk_len),
+                    )
+
+                chunked_features.append(chunk)
+                conv_out_lens.append(conv_out_len)
+
             chunks_per_example.append(len(chunks))
 
         # [total_num_chunks, num_mel_bins, chunk_size]
-        return torch.stack(chunked_features), chunks_per_example
+        return torch.stack(chunked_features), chunks_per_example, conv_out_lens
 
     def forward(
-        self, input_features: torch.Tensor | list[torch.Tensor]
+        self, audio_waveforms: torch.Tensor | list[torch.Tensor]
     ) -> list[torch.Tensor]:
-        if not isinstance(input_features, list):
-            input_features = [input_features]
+        if not isinstance(audio_waveforms, list):
+            audio_waveforms = [audio_waveforms]
 
         # Split long inputs into chunks
-        input_embeds, chunks_per_example = self.prepare_inputs_for_conv(input_features)
+        (
+            input_embeds,
+            chunks_per_example,
+            chunk_out_lens,
+        ) = self.prepare_inputs_for_conv(audio_waveforms)
 
         # [total_num_chunks, ceil(chunk_size / downsample_factor), hidden_size]
         out = self.whisper_encoder([input_embeds])
 
         # Re-concatenate the chunks
         chunk_idx = 0
+        chunk_out_idx = 0
         results = []
         for n_chunks in chunks_per_example:
-            result = out[chunk_idx : chunk_idx + n_chunks].flatten(0, 1)
+            trimmed_chunks = []
+            for _ in range(n_chunks):
+                chunk_out_len = chunk_out_lens[chunk_out_idx]
+                trimmed_chunks.append(out[chunk_idx, :chunk_out_len])
+                chunk_idx += 1
+                chunk_out_idx += 1
+
+            result = torch.cat(trimmed_chunks, dim=0)
             results.append(result)
-            chunk_idx += n_chunks
 
         return results
 
