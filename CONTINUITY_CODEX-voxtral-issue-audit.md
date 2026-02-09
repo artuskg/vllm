@@ -13,7 +13,7 @@ Key decisions:
 - Keep fixes localized to Voxtral/Whisper multimodal paths.
 
 State:
-- Completed locally; remote push blocked by permissions.
+- In progress (finalization): remote updated, pytest installed, tests executed.
 
 Done:
 - Created branch `codex/voxtral-issue-audit`.
@@ -36,16 +36,26 @@ Done:
   - message: `Fix Voxtral audio placeholder and encoder robustness issues`
 - Push attempt outcome:
   - `git push -u origin codex/voxtral-issue-audit` failed with HTTP 403 (no push permission to `vllm-project/vllm.git`).
+- Repointed `origin` to user fork:
+  - `https://github.com/artuskg/vllm.git`
+- Installed test tooling in `.venv`:
+  - `pytest`
+  - `tblib` (required by `tests/conftest.py`)
+- Ran tests:
+  - `.venv/bin/python -m pytest tests/models/multimodal/test_mapping.py -x -vv`
+    - `AriaForConditionalGeneration` passed
+    - failed on `AyaVisionForConditionalGeneration` due gated HF repo access (`CohereLabs/aya-vision-8b` 403), unrelated to Voxtral changes.
+  - `.venv/bin/python -m pytest tests/models/multimodal/test_mapping.py -k "AriaForConditionalGeneration or Mistral3ForConditionalGeneration" -vv`
+    - 2 passed, 12 deselected
 
 Now:
-- Prepare final findings matrix for user and report push blocker.
+- Commit ledger update and push `codex/voxtral-issue-audit` to new origin.
 
 Next:
-- If needed, user can provide a writable remote/fork to push branch.
-- Commit and push branch by default policy unless user requests otherwise.
+- Report final status to user.
 
 Open questions (UNCONFIRMED if needed):
-- UNCONFIRMED: Writable remote for pushing `codex/voxtral-issue-audit` (origin currently denies push).
+- None.
 
 Working set (files/ids/commands):
 - Files:
